@@ -1,0 +1,38 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+build/
+dist/
+*.egg-info/
+.idea/
+.vscode/
+
+# Downloaded data and generated artifacts
+/data/
+/results/
+
+# Private research workspace: never publish these paths
+/Finance_Graph_Learning/
+/experiments/
+/legacy/
+/review.txt
+/GLFinance_notebook.ipynb
+/GFinance_Portfolio_notebook.ipynb
+
+# Ignore notebooks by default; keep only the maintained reproduction notebook
+*.ipynb
+!notebooks/portfolio_walk_forward.ipynb
+
+# Local secrets, credentials, and solver licenses
+.env
+.env.*
+!.env.example
+*.lic
+*.pem
+*.key

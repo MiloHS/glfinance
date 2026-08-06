@@ -1,0 +1,82 @@
+experiment:
+  name: portfolio_walk_forward
+  seed: 42
+  start_date: "2015-01-02"
+  end_date: "2025-07-26"  # yfinance end dates are exclusive
+  outer_weeks: 200
+  validation_weeks: 52
+  recalibration_weeks: 13
+  distance_lookback_weeks: 100
+  bootstrap_replications: 5000
+  bootstrap_block_weeks: 4
+
+data:
+  cache_dir: data/cache
+  price_source: yfinance
+  price_field: Adj Close
+  weekly_rule: W-FRI
+  risk_free_source: fred
+  risk_free_series: DTB3
+  tickers:
+    - {symbol: AAPL, group: Technology}
+    - {symbol: XOM, group: Energy}
+    - {symbol: NEE, group: Utilities}
+    - {symbol: UNH, group: Healthcare}
+    - {symbol: JPM, group: Financials}
+    - {symbol: CAT, group: Industrials}
+    - {symbol: MSFT, group: Technology}
+    - {symbol: CVX, group: Energy}
+    - {symbol: DUK, group: Utilities}
+    - {symbol: ELV, group: Healthcare}
+    - {symbol: BAC, group: Financials}
+    - {symbol: GE, group: Industrials}
+    - {symbol: NVDA, group: Technology}
+    - {symbol: COP, group: Energy}
+    - {symbol: SO, group: Utilities}
+    - {symbol: CI, group: Healthcare}
+    - {symbol: WFC, group: Financials}
+    - {symbol: HON, group: Industrials}
+    - {symbol: GOOGL, group: Technology}
+    - {symbol: SLB, group: Energy}
+    - {symbol: EXC, group: Utilities}
+    - {symbol: HUM, group: Healthcare}
+    - {symbol: GS, group: Financials}
+    - {symbol: UNP, group: Industrials}
+    - {symbol: AMZN, group: Technology}
+    - {symbol: EOG, group: Energy}
+    - {symbol: AEP, group: Utilities}
+    - {symbol: JNJ, group: Healthcare}
+    - {symbol: MS, group: Financials}
+    - {symbol: LMT, group: Industrials}
+    - {symbol: META, group: Technology}
+    - {symbol: OXY, group: Energy}
+    - {symbol: SRE, group: Utilities}
+    - {symbol: PFE, group: Healthcare}
+    - {symbol: BLK, group: Financials}
+    - {symbol: DE, group: Industrials}
+  universe_sizes: [12, 24, 36]
+
+graph:
+  gamma_1: 0.1
+  gamma_2: 0.1
+  gamma_3: 0.1
+  diagonal_floor: 1.0e-6
+  prune_threshold: 1.0e-5
+  solver: SCS
+  solver_options:
+    eps: 1.0e-4
+    max_iters: 20000
+    verbose: false
+
+portfolio:
+  training_windows: [24, 36, 48]
+  k_fractions: [0.6, 0.7, 0.8, 0.9]
+  rho_values: [0.10, 0.12, 0.15, 0.17, 0.20]
+  delta: 1.0e-6
+  long_only: false
+  primary_method: GraphLW
+  methods: [GraphLW, GraphSample, LedoitWolf, Sample, EqualWeight]
+
+output:
+  root_dir: results/portfolio_walk_forward
+
