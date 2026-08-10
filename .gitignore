@@ -16,6 +16,7 @@ dist/
 # Downloaded data and generated artifacts
 /data/
 /results/
+/scripts/
 
 # Private research workspace: never publish these paths
 /Finance_Graph_Learning/

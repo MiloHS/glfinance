@@ -80,10 +80,9 @@ notebooks, exploratory experiments, and manuscript working files are excluded
 by `.gitignore`. Before committing, run:
 
 ```bash
-python scripts/check_repository.py
 pytest
 ```
 
-The same checks run automatically in GitHub Actions. The repository checker
-rejects forbidden research paths, data artifacts, secret-like strings,
-unexpected notebooks, notebook outputs, and unusually large tracked files.
+The test suite runs automatically in GitHub Actions. Before pushing, also
+review `git status --short` and `git diff --cached --name-only` to confirm that
+no local data, results, credentials, or manuscript working files are staged.
