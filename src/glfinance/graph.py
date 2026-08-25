@@ -6,6 +6,22 @@ from typing import Any
 import cvxpy as cp
 import numpy as np
 import pandas as pd
+import os
+from pathlib import Path
+
+import scipy
+
+# Ensure IDAES solver directory and gfortran libraries are in PATH / DYLD_LIBRARY_PATH
+idaes_bin = str(Path.home() / ".idaes" / "bin")
+if idaes_bin not in os.environ.get("PATH", ""):
+    os.environ["PATH"] += os.pathsep + idaes_bin
+
+scipy_dylibs = str(Path(scipy.__file__).parent / ".dylibs")
+current_dyld = os.environ.get("DYLD_LIBRARY_PATH", "")
+if scipy_dylibs not in current_dyld:
+    os.environ["DYLD_LIBRARY_PATH"] = scipy_dylibs + (os.pathsep + current_dyld if current_dyld else "")
+
+
 
 
 @dataclass(frozen=True)
@@ -157,4 +173,209 @@ def learn_causal_graphs(
         )
         previous = graph
     return graphs, records
+
+
+def k_lag_graph_learning_model(
+    X_data: np.ndarray,
+    P_data: np.ndarray,
+    Z_data: np.ndarray,
+    gamma1: float,
+    gamma2: float,
+    gamma3: float,
+    k: int,
+):
+    """Pyomo model for joint graph learning with external regressors."""
+    import pyomo.environ as pyo
+
+    X_data = np.asarray(X_data, dtype=float)
+    P_data = np.asarray(P_data, dtype=float)
+    Z_data = np.asarray(Z_data, dtype=float)
+
+    N, M = X_data.shape
+    assert P_data.shape[0] == M and P_data.shape[1] == N, "P_data must be (M, N, J)"
+    J = P_data.shape[2]
+    assert Z_data.shape == (M, N, N), "Z_data must be (M, N, N)"
+    assert M >= 2, "Need at least two time points"
+
+    model = pyo.ConcreteModel()
+
+    model.Nidx = pyo.RangeSet(0, N - 1)
+    model.AllT = pyo.RangeSet(0, M - 1)
+    model.PredT = pyo.RangeSet(1, M - 1)
+    model.PowT = pyo.RangeSet(0, M - 2)
+    model.Jidx = pyo.RangeSet(0, J - 1)
+
+    j_map = {}
+    idx = 0
+    for lag in range(1, M):
+        for p in range(lag + 1):
+            j_map[(lag, p)] = idx
+            idx += 1
+    model.j_map = j_map
+    J_total = idx
+    model.Cidx = pyo.RangeSet(0, J_total - 1)
+
+    def max_pow_init(m, s):
+        return min(k, (M - 1) - s)
+
+    model.max_pow = pyo.Param(model.PowT, initialize=max_pow_init, within=pyo.NonNegativeIntegers, mutable=False)
+
+    def TPpow_init(m):
+        return ((s, p) for s in m.PowT for p in range(int(m.max_pow[s]) + 1))
+
+    model.TPpow = pyo.Set(dimen=2, initialize=TPpow_init)
+
+    model.L = pyo.Var(model.AllT, model.Nidx, model.Nidx, domain=pyo.Reals)
+
+    for t in model.AllT:
+        for i in model.Nidx:
+            model.L[t, i, i].setlb(1e-8)
+
+    model.c1 = pyo.Var(model.Cidx, domain=pyo.Reals)
+    model.c2 = pyo.Var(model.Cidx, domain=pyo.Reals)
+    model.beta = pyo.Var(model.Jidx, model.PredT, domain=pyo.Reals)
+
+    model.X = pyo.Param(model.Nidx, model.AllT, initialize=lambda m, i, t: float(X_data[i, t]), mutable=False)
+    model.P = pyo.Param(model.AllT, model.Nidx, model.Jidx, initialize=lambda m, t, i, j: float(P_data[t, i, j]), mutable=False)
+    model.Z = pyo.Param(model.AllT, model.Nidx, model.Nidx, initialize=lambda m, t, i, j: float(Z_data[t, i, j]), mutable=False)
+
+    def A_rule(m, t, i, j):
+        if i == j:
+            return 0.0
+        return -m.L[t, i, j]
+
+    model.A = pyo.Expression(model.AllT, model.Nidx, model.Nidx, rule=A_rule)
+
+    def D_rule(m, t, i, j):
+        if i != j:
+            return 0.0
+        return pyo.quicksum(m.A[t, i, r] for r in m.Nidx)
+
+    model.D = pyo.Expression(model.AllT, model.Nidx, model.Nidx, rule=D_rule)
+
+    def Apow_rule(m, s, p, i, j):
+        if p == 0:
+            return 1.0 if i == j else 0.0
+        return pyo.quicksum(m.A[s, i, r] * m.A_pow[s, p - 1, r, j] for r in m.Nidx)
+
+    def Dpow_rule(m, s, p, i, j):
+        if p == 0:
+            return 1.0 if i == j else 0.0
+        return pyo.quicksum(m.D[s, i, r] * m.D_pow[s, p - 1, r, j] for r in m.Nidx)
+
+    model.A_pow = pyo.Expression(model.TPpow, model.Nidx, model.Nidx, rule=Apow_rule)
+    model.D_pow = pyo.Expression(model.TPpow, model.Nidx, model.Nidx, rule=Dpow_rule)
+
+    model.s_true = pyo.Expression(model.Nidx, model.PredT, rule=lambda m, i, t: m.X[i, t])
+
+    def s_hat_rule(m, i, t):
+        expr = pyo.quicksum(m.P[t, i, j] * m.beta[j, t] for j in m.Jidx)
+        max_lag = min(k, t)
+        for lag in range(1, max_lag + 1):
+            s = t - lag
+            for p in range(lag + 1):
+                idx = m.j_map[(lag, p)]
+                expr += m.c1[idx] * pyo.quicksum(m.A_pow[s, p, i, r] * m.X[r, s] for r in m.Nidx)
+                expr += m.c2[idx] * pyo.quicksum(m.D_pow[s, p, i, r] * m.X[r, s] for r in m.Nidx)
+        return expr
+
+    model.s_hat = pyo.Expression(model.Nidx, model.PredT, rule=s_hat_rule)
+
+    def obj_rule(m):
+        trace_term = -pyo.quicksum(m.L[t, i, j] * m.Z[t, j, i] for t in m.AllT for i in m.Nidx for j in m.Nidx)
+        log_term = -gamma1 * pyo.quicksum(pyo.log(m.L[t, i, i]) for t in m.AllT for i in m.Nidx)
+        frob_L = gamma2 * pyo.quicksum(m.L[t, i, j] ** 2 for t in m.AllT for i in m.Nidx for j in m.Nidx)
+        pred = pyo.quicksum((m.s_true[i, t] - m.s_hat[i, t]) ** 2 for t in m.PredT for i in m.Nidx)
+        smooth = gamma3 * pyo.quicksum((m.L[t, i, j] - m.L[t - 1, i, j]) ** 2 for t in m.AllT if t > 0 for i in m.Nidx for j in m.Nidx)
+        return trace_term + log_term + frob_L + pred + smooth
+
+    model.obj = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
+
+    def zero_row_rule(m, t, i):
+        return pyo.quicksum(m.L[t, i, j] for j in m.Nidx) == 0.0
+
+    model.zero_row = pyo.Constraint(model.AllT, model.Nidx, rule=zero_row_rule)
+
+    def symmetry_rule(m, t, i, j):
+        if i < j:
+            return m.L[t, i, j] == m.L[t, j, i]
+        return pyo.Constraint.Skip
+
+    model.symmetry = pyo.Constraint(model.AllT, model.Nidx, model.Nidx, rule=symmetry_rule)
+
+    def offdiag_rule(m, t, i, j):
+        if i != j:
+            return m.L[t, i, j] <= 0.0
+        return pyo.Constraint.Skip
+
+    model.offdiag = pyo.Constraint(model.AllT, model.Nidx, model.Nidx, rule=offdiag_rule)
+
+    return model
+
+
+def solve_instance(
+    X: np.ndarray,
+    P: np.ndarray,
+    Z: np.ndarray,
+    k: int = 2,
+    gammas: tuple[float, float, float] = (1e-3, 1e-1, 1e-3),
+    ipopt_opts: dict[str, Any] | None = None,
+):
+    """Solve the joint graph learning model with IPOPT."""
+    import pyomo.environ as pyo
+
+    gamma1, gamma2, gamma3 = gammas
+    m = k_lag_graph_learning_model(X, P, Z, gamma1, gamma2, gamma3, k)
+
+    N, M = X.shape
+    for t in range(M):
+        for i in range(N):
+            for j in range(N):
+                if i == j:
+                    m.L[t, i, i].value = 1.0
+                elif i < j:
+                    m.L[t, i, j].value = -0.05
+                    m.L[t, j, i].value = -0.05
+        for i in range(N):
+            row_off = sum(m.L[t, i, j].value for j in range(N) if j != i)
+            m.L[t, i, i].value = max(-row_off, 1e-6)
+
+    for j in m.Cidx:
+        m.c1[j].value = 0.0
+        m.c2[j].value = 0.0
+    for t in m.PredT:
+        for j in m.Jidx:
+            m.beta[j, t].value = 0.0
+
+    solver = pyo.SolverFactory("ipopt")
+    if ipopt_opts:
+        for k_, v_ in ipopt_opts.items():
+            solver.options[k_] = v_
+    results = solver.solve(m, tee=True)
+
+    obj_val = pyo.value(m.obj)
+
+    L = np.zeros((M, N, N))
+    for t in range(M):
+        for i in range(N):
+            for j in range(N):
+                L[t, i, j] = pyo.value(m.L[t, i, j])
+
+    J_total = len(m.Cidx)
+    c1 = np.array([pyo.value(m.c1[j]) for j in range(J_total)])
+    c2 = np.array([pyo.value(m.c2[j]) for j in range(J_total)])
+
+    J = len(m.Jidx)
+    beta = np.zeros((J, M))
+    for t in m.PredT:
+        for j in m.Jidx:
+            beta[j, t] = pyo.value(m.beta[j, t])
+
+    s_hat = np.zeros((N, M))
+    for t in m.PredT:
+        for i in m.Nidx:
+            s_hat[i, t] = pyo.value(m.s_hat[i, t])
+
+    return m, results, obj_val, L, c1, c2, beta, s_hat
+
 
