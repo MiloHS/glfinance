@@ -184,7 +184,7 @@ def k_lag_graph_learning_model(
     gamma3: float,
     k: int,
 ):
-    """Pyomo model for joint graph learning with external regressors."""
+    """Pyomo model for the paper's finite-lag polynomial graph process."""
     import pyomo.environ as pyo
 
     X_data = np.asarray(X_data, dtype=float)
@@ -196,6 +196,9 @@ def k_lag_graph_learning_model(
     J = P_data.shape[2]
     assert Z_data.shape == (M, N, N), "Z_data must be (M, N, N)"
     assert M >= 2, "Need at least two time points"
+    if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or k < 1:
+        raise ValueError("k must be a positive integer")
+    effective_k = min(int(k), M - 1)
 
     model = pyo.ConcreteModel()
 
@@ -207,8 +210,8 @@ def k_lag_graph_learning_model(
 
     j_map = {}
     idx = 0
-    for lag in range(1, M):
-        for p in range(lag + 1):
+    for lag in range(1, effective_k + 1):
+        for p in range(1, lag + 1):
             j_map[(lag, p)] = idx
             idx += 1
     model.j_map = j_map
@@ -216,12 +219,16 @@ def k_lag_graph_learning_model(
     model.Cidx = pyo.RangeSet(0, J_total - 1)
 
     def max_pow_init(m, s):
-        return min(k, (M - 1) - s)
+        return min(effective_k, (M - 1) - s)
 
     model.max_pow = pyo.Param(model.PowT, initialize=max_pow_init, within=pyo.NonNegativeIntegers, mutable=False)
 
     def TPpow_init(m):
-        return ((s, p) for s in m.PowT for p in range(int(m.max_pow[s]) + 1))
+        return (
+            (s, p)
+            for s in m.PowT
+            for p in range(1, int(m.max_pow[s]) + 1)
+        )
 
     model.TPpow = pyo.Set(dimen=2, initialize=TPpow_init)
 
@@ -229,7 +236,7 @@ def k_lag_graph_learning_model(
 
     for t in model.AllT:
         for i in model.Nidx:
-            model.L[t, i, i].setlb(1e-8)
+            model.L[t, i, i].setlb(1e-6)
 
     model.c1 = pyo.Var(model.Cidx, domain=pyo.Reals)
     model.c2 = pyo.Var(model.Cidx, domain=pyo.Reals)
@@ -254,13 +261,13 @@ def k_lag_graph_learning_model(
     model.D = pyo.Expression(model.AllT, model.Nidx, model.Nidx, rule=D_rule)
 
     def Apow_rule(m, s, p, i, j):
-        if p == 0:
-            return 1.0 if i == j else 0.0
+        if p == 1:
+            return m.A[s, i, j]
         return pyo.quicksum(m.A[s, i, r] * m.A_pow[s, p - 1, r, j] for r in m.Nidx)
 
     def Dpow_rule(m, s, p, i, j):
-        if p == 0:
-            return 1.0 if i == j else 0.0
+        if p == 1:
+            return m.D[s, i, j]
         return pyo.quicksum(m.D[s, i, r] * m.D_pow[s, p - 1, r, j] for r in m.Nidx)
 
     model.A_pow = pyo.Expression(model.TPpow, model.Nidx, model.Nidx, rule=Apow_rule)
@@ -270,10 +277,10 @@ def k_lag_graph_learning_model(
 
     def s_hat_rule(m, i, t):
         expr = pyo.quicksum(m.P[t, i, j] * m.beta[j, t] for j in m.Jidx)
-        max_lag = min(k, t)
+        max_lag = min(effective_k, t)
         for lag in range(1, max_lag + 1):
             s = t - lag
-            for p in range(lag + 1):
+            for p in range(1, lag + 1):
                 idx = m.j_map[(lag, p)]
                 expr += m.c1[idx] * pyo.quicksum(m.A_pow[s, p, i, r] * m.X[r, s] for r in m.Nidx)
                 expr += m.c2[idx] * pyo.quicksum(m.D_pow[s, p, i, r] * m.X[r, s] for r in m.Nidx)
@@ -366,16 +373,15 @@ def solve_instance(
     c2 = np.array([pyo.value(m.c2[j]) for j in range(J_total)])
 
     J = len(m.Jidx)
-    beta = np.zeros((J, M))
+    beta = np.zeros((J, M - 1))
     for t in m.PredT:
         for j in m.Jidx:
-            beta[j, t] = pyo.value(m.beta[j, t])
+            beta[j, t - 1] = pyo.value(m.beta[j, t])
 
-    s_hat = np.zeros((N, M))
+    s_hat = np.zeros((N, M - 1))
     for t in m.PredT:
         for i in m.Nidx:
-            s_hat[i, t] = pyo.value(m.s_hat[i, t])
+            s_hat[i, t - 1] = pyo.value(m.s_hat[i, t])
 
     return m, results, obj_val, L, c1, c2, beta, s_hat
-
 

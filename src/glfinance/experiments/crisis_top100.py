@@ -176,8 +176,8 @@ def solve_crisis_model(
     P: np.ndarray,
     Z: np.ndarray,
     top_tickers: list[str],
-    k: int = 0,
-    gammas: tuple[float, float, float] = (40.0, 1e-5, 1.5e-2),
+    k: int = 1,
+    gammas: tuple[float, float, float] = (40.0, 1.5e-5, 1.5e-2),
     experiment_name: str = "crisis",
 ) -> dict[str, Any]:
     """Step 2: Solve the joint graph learning model given prepared X, P, Z tensors."""
@@ -227,8 +227,8 @@ def run_crisis_experiment(
     regressor_names: list[str] | None = None,
     ff_base_path: str | Path = "Fama-French Factors",
     cache_dir: str | Path = "cache",
-    k: int = 0,
-    gammas: tuple[float, float, float] = (40.0, 1e-5, 1.5e-2),
+    k: int = 1,
+    gammas: tuple[float, float, float] = (40.0, 1.5e-5, 1.5e-2),
     experiment_name: str = "crisis",
 ) -> dict[str, Any]:
     """Execute complete workflow: Step 1 (Build dataset) + Step 2 (Solve model)."""

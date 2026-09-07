@@ -151,6 +151,8 @@ run_crisis_experiment(
     start_date='2006-03-01',
     end_date='2010-12-31',
     lookback_weeks=20,
+    k=1,
+    gammas=(40.0, 1.5e-5, 1.5e-2),
     experiment_name='crisis_std'
 )
 "
@@ -166,6 +168,8 @@ run_crisis_experiment(
     start_date='2019-01-01',
     end_date='2021-12-31',
     lookback_weeks=20,
+    k=1,
+    gammas=(40.0, 1.5e-5, 1.5e-2),
     experiment_name='covid_std'
 )
 "
@@ -180,5 +184,4 @@ Downloaded market data (`*.csv`, `Fama-French Factors/`), binary cache files (`c
 ```bash
 git status --short
 ```
-
 
