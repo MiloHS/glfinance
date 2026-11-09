@@ -9,8 +9,11 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 import sklearn
-import yfinance as yf
 import ssl
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
 
 try:
     ssl._create_default_https_context = ssl._create_unverified_context
@@ -511,13 +514,20 @@ def prepare_XPZ(
     compustat_df: pd.DataFrame | str | Path | None = None,
     crsp_df: pd.DataFrame | str | Path | None = None,
     cache_dir: str | Path = "cache",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    price_df: pd.DataFrame | None = None,
+    volume_df: pd.DataFrame | None = None,
+    return_tickers: bool = False,
+    return_dates: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | tuple[np.ndarray, ...]:
     import gzip, hashlib, json, pickle
 
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
 
+    tickers = list(dict.fromkeys(tickers))
+
     key = {
+        "version": "v4_dated_and_lagged",
         "tickers": sorted(tickers),
         "start": start_date,
         "end": end_date,
@@ -529,23 +539,67 @@ def prepare_XPZ(
 
     if cache_file.exists():
         with gzip.open(cache_file, "rb") as f:
-            X, P, Z = pickle.load(f)
+            cached_data = pickle.load(f)
         print("Loaded X,P,Z from cache ➜", cache_file.name)
-        return X, P, Z
+        if len(cached_data) == 5:
+            X_c, P_c, Z_c, valid_t_c, valid_d_c = cached_data
+            if return_tickers and return_dates:
+                return X_c, P_c, Z_c, valid_t_c, valid_d_c
+            if return_tickers:
+                return X_c, P_c, Z_c, valid_t_c
+            if return_dates:
+                return X_c, P_c, Z_c, valid_d_c
+            return X_c, P_c, Z_c
+        elif len(cached_data) == 4:
+            X_c, P_c, Z_c, valid_t_c = cached_data
+            if return_tickers and return_dates:
+                return X_c, P_c, Z_c, valid_t_c, []
+            if return_tickers:
+                return X_c, P_c, Z_c, valid_t_c
+            if return_dates:
+                return X_c, P_c, Z_c, []
+            return X_c, P_c, Z_c
+        else:
+            X_c, P_c, Z_c = cached_data
+            if return_tickers and return_dates:
+                return X_c, P_c, Z_c, tickers, []
+            if return_tickers:
+                return X_c, P_c, Z_c, tickers
+            if return_dates:
+                return X_c, P_c, Z_c, []
+            return X_c, P_c, Z_c
 
     dt_start = pd.to_datetime(start_date)
     dt_end = pd.to_datetime(end_date)
     bulk_start = (dt_start - pd.Timedelta(days=220)).strftime("%Y-%m-%d")
 
-    print(f"Bulk downloading daily prices & volume for {len(tickers)} tickers from {bulk_start} to {end_date}...")
-    bulk_data = yf.download(tickers, start=bulk_start, end=end_date, auto_adjust=False, progress=False)
-
-    if isinstance(bulk_data.columns, pd.MultiIndex):
-        adj_close = bulk_data["Adj Close"]
-        volume = bulk_data["Volume"]
+    if price_df is not None:
+        adj_close = price_df.copy()
+        if volume_df is not None:
+            volume = volume_df.copy()
+        else:
+            volume = pd.DataFrame(1.0, index=adj_close.index, columns=adj_close.columns)
     else:
-        adj_close = bulk_data[["Adj Close"]].rename(columns={"Adj Close": tickers[0]})
-        volume = bulk_data[["Volume"]].rename(columns={"Volume": tickers[0]})
+        if yf is None:
+            raise ImportError("yfinance is required when price_df is not provided.")
+        print(f"Bulk downloading daily prices & volume for {len(tickers)} tickers from {bulk_start} to {end_date}...")
+        bulk_data = yf.download(tickers, start=bulk_start, end=end_date, auto_adjust=False, progress=False)
+
+        if isinstance(bulk_data.columns, pd.MultiIndex):
+            adj_close = bulk_data["Adj Close"]
+            volume = bulk_data["Volume"]
+        else:
+            adj_close = bulk_data[["Adj Close"]].rename(columns={"Adj Close": tickers[0]})
+            volume = bulk_data[["Volume"]].rename(columns={"Volume": tickers[0]})
+
+    # Ensure columns strictly match tickers order (filtering to available tickers)
+    available_tickers = [t for t in tickers if t in adj_close.columns]
+    if not available_tickers:
+        raise ValueError("None of the requested tickers were found in price data.")
+    tickers = available_tickers
+    adj_close = adj_close[tickers]
+    if volume is not None and not volume.empty:
+        volume = volume[[t for t in tickers if t in volume.columns]]
 
     # Vectorized bulk regressors
     # 1. Momentum: 6-month returns (~126 trading days)
@@ -570,11 +624,13 @@ def prepare_XPZ(
 
     weekly_prices = adj_close.loc[start_date:end_date].resample("W-FRI").last()
     weekly_rets = np.log(weekly_prices / weekly_prices.shift(1)).dropna(how="all").T
+    weekly_rets = weekly_rets.reindex(index=tickers)
 
     monthly_prices = adj_close.loc[start_date:end_date].resample("ME").last()
-    monthly_log_rets = np.log(monthly_prices / monthly_prices.shift(1)).dropna(how="all").iloc[:, ::-1].T
+    monthly_log_rets = np.log(monthly_prices / monthly_prices.shift(1)).dropna(how="all").T
+    monthly_log_rets = monthly_log_rets.reindex(index=tickers)
 
-    periods = weekly_rets.T.index.to_period("M")
+    periods = weekly_rets.columns.to_period("M")
     dist_mats, fridays = [], []
 
     for period, group in weekly_rets.T.groupby(periods):
@@ -582,9 +638,9 @@ def prepare_XPZ(
             continue
         end_d = group.index[-1]
         fridays.append(end_d)
-        pos = weekly_rets.T.index.get_loc(end_d)
+        pos = weekly_rets.columns.get_loc(end_d)
         if pos >= lookback_weeks - 1:
-            window = weekly_rets.T.iloc[pos - lookback_weeks + 1 : pos + 1].T.values
+            window = weekly_rets.iloc[:, pos - lookback_weeks + 1 : pos + 1].to_numpy()
             corr = np.corrcoef(window)
             dist = 1.0 / (np.abs(corr) + 0.01) - 1.0 / 1.01
             np.fill_diagonal(dist, 0.0)
@@ -594,7 +650,7 @@ def prepare_XPZ(
 
     friday_to_monthend = {f: (f + pd.tseries.offsets.MonthEnd(0)).normalize() for f in fridays}
 
-    X_cols, P_list, Z_list = [], [], []
+    X_cols, P_list, Z_list, dates_list = [], [], [], []
     for dist, friday in zip(dist_mats, fridays):
         if dist is None:
             continue
@@ -602,54 +658,74 @@ def prepare_XPZ(
         if me_date not in monthly_log_rets.columns:
             continue
 
-        X_cols.append(monthly_log_rets.loc[:, me_date].values)
+        X_cols.append(monthly_log_rets.loc[tickers, me_date].to_numpy(dtype=float))
+        dates_list.append(me_date)
 
         N = len(tickers)
         J = 1 + len(regressor_names)
         P_mat = np.ones((N, J))
 
-        sub_prices = adj_close[:me_date]
-        if not sub_prices.empty:
-            actual_dt = sub_prices.index[-1]
-            mom_row = bulk_momentum.loc[actual_dt] if actual_dt in bulk_momentum.index else None
-            vol_row = bulk_volatility.loc[actual_dt] if actual_dt in bulk_volatility.index else None
-            prc_row = adj_close.loc[actual_dt]
-            volu_row = volume.loc[actual_dt] if actual_dt in volume.index else None
+        # Lagging to month t-1: evaluate characteristics strictly using information available at end of month t-1
+        prev_me_date = (me_date.replace(day=1) - pd.Timedelta(days=1)) + pd.tseries.offsets.MonthEnd(0)
+        prev_month_start = prev_me_date.replace(day=1)
+
+        sub_prices_prev = adj_close[:prev_me_date]
+        if not sub_prices_prev.empty:
+            prev_dt = sub_prices_prev.index[-1]
+            mom_row = bulk_momentum.loc[prev_dt] if prev_dt in bulk_momentum.index else None
+            vol_row = bulk_volatility.loc[prev_dt] if prev_dt in bulk_volatility.index else None
+            prc_row = adj_close.loc[prev_dt]
+            # Average daily volume across all trading days in month t-1
+            month_vol_slice = volume.loc[(volume.index >= prev_month_start) & (volume.index <= prev_me_date)]
+            if not month_vol_slice.empty:
+                avg_daily_vol_row = month_vol_slice.mean(axis=0)
+            else:
+                avg_daily_vol_row = volume.loc[prev_dt] if (volume is not None and prev_dt in volume.index) else None
         else:
-            mom_row = vol_row = prc_row = volu_row = None
+            mom_row = vol_row = prc_row = avg_daily_vol_row = None
+
+        # 3-month (90-day) reporting lag cutoff for Compustat accounting data to eliminate lookahead bias
+        compustat_cutoff = prev_me_date - pd.Timedelta(days=90)
 
         for i, tic in enumerate(tickers):
             for j, name in enumerate(regressor_names, start=1):
                 if name == "interest_rate":
-                    val = get_interest_rate(tic, me_date, rates_df) if rates_df is not None else np.nan
+                    val = get_interest_rate(tic, prev_me_date, rates_df) if rates_df is not None else np.nan
                 elif name in {"mkt-rf", "smb", "hml"}:
                     fac = {"mkt-rf": "Mkt-RF", "smb": "SMB", "hml": "HML"}[name]
-                    val = _get_ff_factor(tic, me_date, fac, ff_map) if ff_map is not None else np.nan
+                    val = _get_ff_factor(tic, prev_me_date, fac, ff_map) if ff_map is not None else np.nan
                 elif name == "momentum":
+                    # 126-trading-day return ending at the end of month t-1
                     val = _to_float(mom_row[tic]) if mom_row is not None and tic in mom_row else np.nan
                 elif name == "volatility":
+                    # 21-day rolling std of daily log returns from month t-1
                     val = _to_float(vol_row[tic]) if vol_row is not None and tic in vol_row else np.nan
                 elif name == "pe_ratio":
+                    # Price at end of month t-1 divided by EPS reported with >= 3-month lag
                     price_val = _to_float(prc_row[tic]) if prc_row is not None and tic in prc_row else np.nan
                     eps_val = np.nan
                     if compustat_df is not None:
-                        sub_c = compustat_df[(compustat_df["tic"] == tic) & (compustat_df["datadate"] <= me_date)].sort_values("datadate")
+                        sub_c = compustat_df[(compustat_df["tic"] == tic) & (compustat_df["datadate"] <= compustat_cutoff)].sort_values("datadate")
                         if not sub_c.empty:
                             eps_val = _to_float(sub_c.iloc[-1]["epsf12"])
                     val = (price_val / eps_val) if (price_val and eps_val and eps_val != 0) else np.nan
                 elif name == "turnover":
-                    v_val = _to_float(volu_row[tic]) if volu_row is not None and tic in volu_row else np.nan
+                    # Average daily turnover from month t-1 (average daily volume / shares outstanding)
+                    v_val = _to_float(avg_daily_vol_row[tic]) if avg_daily_vol_row is not None and tic in avg_daily_vol_row else np.nan
                     shares_val = np.nan
-                    # First try CRSP ShrOut (in 1000s or units)
+                    # CRSP ShrOut as of month t-1
                     if crsp_df is not None:
-                        sub_crsp = crsp_df[(crsp_df["Ticker"] == tic) & (crsp_df["MthCalDt"] <= me_date)].sort_values("MthCalDt")
+                        sub_crsp = crsp_df[(crsp_df["Ticker"] == tic) & (crsp_df["MthCalDt"] <= prev_me_date)].sort_values("MthCalDt")
                         if not sub_crsp.empty:
                             shares_val = _to_float(sub_crsp.iloc[-1]["ShrOut"])
-                    # Fallback to Compustat cshoq (in millions)
+                    # Fallback to Compustat cshoq (with 3-month reporting lag)
                     if (np.isnan(shares_val) or shares_val == 0) and compustat_df is not None:
-                        sub_c = compustat_df[(compustat_df["tic"] == tic) & (compustat_df["datadate"] <= me_date)].sort_values("datadate")
+                        sub_c = compustat_df[(compustat_df["tic"] == tic) & (compustat_df["datadate"] <= compustat_cutoff)].sort_values("datadate")
                         if not sub_c.empty:
                             shares_val = _to_float(sub_c.iloc[-1]["cshoq"]) * 1e6
+                    # Fallback for synthetic/offline test data when external databases are not provided
+                    if (np.isnan(shares_val) or shares_val == 0) and crsp_df is None and compustat_df is None:
+                        shares_val = 1e6
                     val = (v_val / shares_val) if (v_val and shares_val and shares_val != 0) else np.nan
                 else:
                     val = np.nan
@@ -674,6 +750,8 @@ def prepare_XPZ(
         removed_tickers = [tickers[i] for i in range(len(tickers)) if not valid_ticker_mask[i]]
         print(f"Removing {len(removed_tickers)} tickers throwing NaNs: {removed_tickers}")
 
+    valid_tickers = [tickers[i] for i in range(len(tickers)) if valid_ticker_mask[i]]
+
     X = X_raw[valid_ticker_mask, :]
     P = P_raw[:, valid_ticker_mask, :]
     Z = Z_raw[:, valid_ticker_mask, :][:, :, valid_ticker_mask]
@@ -692,8 +770,14 @@ def prepare_XPZ(
     print("Applied cross-sectional Z-score standardization to regressors P (excluding intercept).")
 
     with gzip.open(cache_file, "wb") as f:
-        pickle.dump((X, P, Z), f, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump((X, P, Z, valid_tickers, dates_list), f, protocol=pickle.HIGHEST_PROTOCOL)
     print("Built X,P,Z and cached ➜", cache_file.name)
 
+    if return_tickers and return_dates:
+        return X, P, Z, valid_tickers, dates_list
+    if return_tickers:
+        return X, P, Z, valid_tickers
+    if return_dates:
+        return X, P, Z, dates_list
     return X, P, Z
 

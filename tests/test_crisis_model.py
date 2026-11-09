@@ -2,7 +2,25 @@ import inspect
 
 import numpy as np
 import pyomo.environ as pyo
-import pytest
+try:
+    import pytest
+except ImportError:
+    import contextlib
+    import re
+
+    class _PytestFallback:
+        @staticmethod
+        @contextlib.contextmanager
+        def raises(exc, match=None):
+            try:
+                yield
+            except exc as e:
+                if match and not re.search(match, str(e)):
+                    raise AssertionError(f"Pattern {match!r} not found in {str(e)!r}")
+            else:
+                raise AssertionError(f"Expected exception {exc} but none was raised")
+
+    pytest = _PytestFallback()
 
 from glfinance.experiments.crisis_top100 import (
     run_crisis_experiment,
@@ -83,7 +101,7 @@ def test_model_rejects_zero_lags() -> None:
         build_small_model(k=0)
 
 
-def test_solver_outputs_exclude_initial_time_point(monkeypatch) -> None:
+def test_solver_outputs_exclude_initial_time_point(monkeypatch=None) -> None:
     class FakeSolver:
         def __init__(self) -> None:
             self.options = {}
@@ -91,18 +109,27 @@ def test_solver_outputs_exclude_initial_time_point(monkeypatch) -> None:
         def solve(self, model, tee=False):
             return object()
 
-    monkeypatch.setattr(pyo, "SolverFactory", lambda name: FakeSolver())
-    x, regressors, distances = small_inputs()
-    _, _, _, laplacians, c1, c2, beta, predictions = solve_instance(
-        x,
-        regressors,
-        distances,
-        k=1,
-        gammas=(40.0, 1.5e-5, 1.5e-2),
-    )
+    orig_factory = pyo.SolverFactory
+    if monkeypatch is not None:
+        monkeypatch.setattr(pyo, "SolverFactory", lambda name: FakeSolver())
+    else:
+        pyo.SolverFactory = lambda name: FakeSolver()
 
-    assert laplacians.shape == (3, 2, 2)
-    assert c1.shape == (1,)
-    assert c2.shape == (1,)
-    assert beta.shape == (2, 2)
-    assert predictions.shape == (2, 2)
+    try:
+        x, regressors, distances = small_inputs()
+        _, _, _, laplacians, c1, c2, beta, predictions = solve_instance(
+            x,
+            regressors,
+            distances,
+            k=1,
+            gammas=(40.0, 1.5e-5, 1.5e-2),
+        )
+
+        assert laplacians.shape == (3, 2, 2)
+        assert c1.shape == (1,)
+        assert c2.shape == (1,)
+        assert beta.shape == (2, 2)
+        assert predictions.shape == (2, 2)
+    finally:
+        if monkeypatch is None:
+            pyo.SolverFactory = orig_factory

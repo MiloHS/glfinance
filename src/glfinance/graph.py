@@ -235,89 +235,92 @@ def k_lag_graph_learning_model(
     model.L = pyo.Var(model.AllT, model.Nidx, model.Nidx, domain=pyo.Reals)
 
     for t in model.AllT:
-        for i in model.Nidx:
-            model.L[t, i, i].setlb(1e-6)
+        for i_idx in model.Nidx:
+            model.L[t, i_idx, i_idx].setlb(1e-6)
 
     model.c1 = pyo.Var(model.Cidx, domain=pyo.Reals)
     model.c2 = pyo.Var(model.Cidx, domain=pyo.Reals)
     model.beta = pyo.Var(model.Jidx, model.PredT, domain=pyo.Reals)
 
-    model.X = pyo.Param(model.Nidx, model.AllT, initialize=lambda m, i, t: float(X_data[i, t]), mutable=False)
-    model.P = pyo.Param(model.AllT, model.Nidx, model.Jidx, initialize=lambda m, t, i, j: float(P_data[t, i, j]), mutable=False)
-    model.Z = pyo.Param(model.AllT, model.Nidx, model.Nidx, initialize=lambda m, t, i, j: float(Z_data[t, i, j]), mutable=False)
+    model.X = pyo.Param(model.Nidx, model.AllT, initialize=lambda m, row_idx, t: float(X_data[row_idx, t]), mutable=False)
+    model.P = pyo.Param(model.AllT, model.Nidx, model.Jidx, initialize=lambda m, t, row_idx, j: float(P_data[t, row_idx, j]), mutable=False)
+    model.Z = pyo.Param(model.AllT, model.Nidx, model.Nidx, initialize=lambda m, t, row_idx, col_idx: float(Z_data[t, row_idx, col_idx]), mutable=False)
 
-    def A_rule(m, t, i, j):
-        if i == j:
+    def A_rule(m, t, row_idx, col_idx):
+        if row_idx == col_idx:
             return 0.0
-        return -m.L[t, i, j]
+        return -m.L[t, row_idx, col_idx]
 
     model.A = pyo.Expression(model.AllT, model.Nidx, model.Nidx, rule=A_rule)
 
-    def D_rule(m, t, i, j):
-        if i != j:
+    def D_rule(m, t, row_idx, col_idx):
+        if row_idx != col_idx:
             return 0.0
-        return pyo.quicksum(m.A[t, i, r] for r in m.Nidx)
+        return pyo.quicksum(m.A[t, row_idx, r] for r in m.Nidx)
 
     model.D = pyo.Expression(model.AllT, model.Nidx, model.Nidx, rule=D_rule)
 
-    def Apow_rule(m, s, p, i, j):
+    def Apow_rule(m, s, p, row_idx, col_idx):
         if p == 1:
-            return m.A[s, i, j]
-        return pyo.quicksum(m.A[s, i, r] * m.A_pow[s, p - 1, r, j] for r in m.Nidx)
+            return m.A[s, row_idx, col_idx]
+        return pyo.quicksum(m.A[s, row_idx, r] * m.A_pow[s, p - 1, r, col_idx] for r in m.Nidx)
 
-    def Dpow_rule(m, s, p, i, j):
+    def Dpow_rule(m, s, p, row_idx, col_idx):
         if p == 1:
-            return m.D[s, i, j]
-        return pyo.quicksum(m.D[s, i, r] * m.D_pow[s, p - 1, r, j] for r in m.Nidx)
+            return m.D[s, row_idx, col_idx]
+        return pyo.quicksum(m.D[s, row_idx, r] * m.D_pow[s, p - 1, r, col_idx] for r in m.Nidx)
 
     model.A_pow = pyo.Expression(model.TPpow, model.Nidx, model.Nidx, rule=Apow_rule)
     model.D_pow = pyo.Expression(model.TPpow, model.Nidx, model.Nidx, rule=Dpow_rule)
 
-    model.s_true = pyo.Expression(model.Nidx, model.PredT, rule=lambda m, i, t: m.X[i, t])
+    model.s_true = pyo.Expression(model.Nidx, model.PredT, rule=lambda m, row_idx, t: m.X[row_idx, t])
 
-    def s_hat_rule(m, i, t):
-        expr = pyo.quicksum(m.P[t, i, j] * m.beta[j, t] for j in m.Jidx)
+    def s_hat_rule(m, row_idx, t):
+        expr = pyo.quicksum(m.P[t, row_idx, j] * m.beta[j, t] for j in m.Jidx)
         max_lag = min(effective_k, t)
         for lag in range(1, max_lag + 1):
             s = t - lag
             for p in range(1, lag + 1):
                 idx = m.j_map[(lag, p)]
-                expr += m.c1[idx] * pyo.quicksum(m.A_pow[s, p, i, r] * m.X[r, s] for r in m.Nidx)
-                expr += m.c2[idx] * pyo.quicksum(m.D_pow[s, p, i, r] * m.X[r, s] for r in m.Nidx)
+                expr += m.c1[idx] * pyo.quicksum(m.A_pow[s, p, row_idx, r] * m.X[r, s] for r in m.Nidx)
+                expr += m.c2[idx] * pyo.quicksum(m.D_pow[s, p, row_idx, r] * m.X[r, s] for r in m.Nidx)
         return expr
 
     model.s_hat = pyo.Expression(model.Nidx, model.PredT, rule=s_hat_rule)
 
     def obj_rule(m):
-        trace_term = -pyo.quicksum(m.L[t, i, j] * m.Z[t, j, i] for t in m.AllT for i in m.Nidx for j in m.Nidx)
-        log_term = -gamma1 * pyo.quicksum(pyo.log(m.L[t, i, i]) for t in m.AllT for i in m.Nidx)
-        frob_L = gamma2 * pyo.quicksum(m.L[t, i, j] ** 2 for t in m.AllT for i in m.Nidx for j in m.Nidx)
-        pred = pyo.quicksum((m.s_true[i, t] - m.s_hat[i, t]) ** 2 for t in m.PredT for i in m.Nidx)
-        smooth = gamma3 * pyo.quicksum((m.L[t, i, j] - m.L[t - 1, i, j]) ** 2 for t in m.AllT if t > 0 for i in m.Nidx for j in m.Nidx)
+        trace_term = -pyo.quicksum(m.L[t, row_idx, col_idx] * m.Z[t, col_idx, row_idx] for t in m.AllT for row_idx in m.Nidx for col_idx in m.Nidx)
+        log_term = -gamma1 * pyo.quicksum(pyo.log(m.L[t, row_idx, row_idx]) for t in m.AllT for row_idx in m.Nidx)
+        frob_L = gamma2 * pyo.quicksum(m.L[t, row_idx, col_idx] ** 2 for t in m.AllT for row_idx in m.Nidx for col_idx in m.Nidx)
+        pred = pyo.quicksum((m.s_true[row_idx, t] - m.s_hat[row_idx, t]) ** 2 for t in m.PredT for row_idx in m.Nidx)
+        smooth = gamma3 * pyo.quicksum((m.L[t, row_idx, col_idx] - m.L[t - 1, row_idx, col_idx]) ** 2 for t in m.AllT if t > 0 for row_idx in m.Nidx for col_idx in m.Nidx)
         return trace_term + log_term + frob_L + pred + smooth
 
     model.obj = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
 
-    def zero_row_rule(m, t, i):
-        return pyo.quicksum(m.L[t, i, j] for j in m.Nidx) == 0.0
+    def zero_row_rule(m, t, row_idx):
+        return pyo.quicksum(m.L[t, row_idx, col_idx] for col_idx in m.Nidx) == 0.0
 
     model.zero_row = pyo.Constraint(model.AllT, model.Nidx, rule=zero_row_rule)
 
-    def symmetry_rule(m, t, i, j):
-        if i < j:
-            return m.L[t, i, j] == m.L[t, j, i]
+    def symmetry_rule(m, t, row_idx, col_idx):
+        if row_idx < col_idx:
+            return m.L[t, row_idx, col_idx] == m.L[t, col_idx, row_idx]
         return pyo.Constraint.Skip
 
     model.symmetry = pyo.Constraint(model.AllT, model.Nidx, model.Nidx, rule=symmetry_rule)
 
-    def offdiag_rule(m, t, i, j):
-        if i != j:
-            return m.L[t, i, j] <= 0.0
+    def offdiag_rule(m, t, row_idx, col_idx):
+        if row_idx != col_idx:
+            return m.L[t, row_idx, col_idx] <= 0.0
         return pyo.Constraint.Skip
 
     model.offdiag = pyo.Constraint(model.AllT, model.Nidx, model.Nidx, rule=offdiag_rule)
 
     return model
+
+
+i_lag_graph_learning_model = k_lag_graph_learning_model
 
 
 def solve_instance(
@@ -333,6 +336,7 @@ def solve_instance(
 
     gamma1, gamma2, gamma3 = gammas
     m = k_lag_graph_learning_model(X, P, Z, gamma1, gamma2, gamma3, k)
+
 
     N, M = X.shape
     for t in range(M):

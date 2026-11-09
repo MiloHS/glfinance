@@ -17,6 +17,10 @@ dist/
 /data/
 /results/
 /scripts/
+cache/
+*.csv
+*.png
+Fama-French Factors/
 
 # Private research workspace: never publish these paths
 /Finance_Graph_Learning/
