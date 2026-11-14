@@ -73,22 +73,44 @@ def test_compustat_eps_3month_reporting_lag() -> None:
     """Verify that earnings announcements respect the 3-month (90-day) filing lag."""
     from glfinance.experiments.crisis_top100 import get_eps_from_compustat
 
+    # 1. Controlled synthetic test (runs in CI without external WRDS files)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        synth_path = Path(tmp_dir) / "synth_compustat.csv"
+        # Two quarterly reports for TEST:
+        # Quarter 1: 2007-12-31 with EPS = 1.50
+        # Quarter 2: 2008-03-31 with EPS = 2.50
+        synth_df = pd.DataFrame({
+            "tic": ["TEST", "TEST"],
+            "datadate": ["2007-12-31", "2008-03-31"],
+            "epsf12": [1.50, 2.50],
+        })
+        synth_df.to_csv(synth_path, index=False)
+
+        # Query on 2008-04-15:
+        # 2008-03-31 was only 15 days ago (< 90 days), so 10-Q is not yet filed.
+        # With lag_days=90, the latest available filing is 2007-12-31 (106 days ago >= 90).
+        eps_lagged = get_eps_from_compustat("TEST", "2008-04-15", synth_path, lag_days=90)
+        assert np.isclose(eps_lagged, 1.50), f"Expected 1.50 with 90-day lag, got {eps_lagged}"
+
+        # If zero lag were used (lookahead bias), it would pick 2.50
+        eps_no_lag = get_eps_from_compustat("TEST", "2008-04-15", synth_path, lag_days=0)
+        assert np.isclose(eps_no_lag, 2.50), f"Expected 2.50 without lag, got {eps_no_lag}"
+
+        # On 2008-07-01 (92 days after 2008-03-31), Quarter 2 is now available
+        eps_available = get_eps_from_compustat("TEST", "2008-07-01", synth_path, lag_days=90)
+        assert np.isclose(eps_available, 2.50), f"Expected 2.50 once 90 days elapse, got {eps_available}"
+
+    # 2. Local check on actual WRDS file if present
     repo_root = Path(__file__).parent.parent
     comp_path = repo_root / "crisis_compustat.csv"
-    assert comp_path.exists()
-
-    # For day = 2008-04-15:
-    # A quarter ending 2008-03-31 has NOT had 90 days elapse (only 15 days), so its 10-Q is not yet filed.
-    # The latest available report with a 90-day lag must be from 2007-12-31 or earlier.
-    eps = get_eps_from_compustat("XOM", "2008-04-15", comp_path, lag_days=90)
-    assert not np.isnan(eps)
-
-    # Directly check Compustat date for XOM
-    comp = pd.read_csv(comp_path)
-    comp["datadate"] = pd.to_datetime(comp["datadate"])
-    sub = comp[(comp["tic"] == "XOM") & (comp["datadate"] <= pd.to_datetime("2008-04-15") - pd.Timedelta(days=90))]
-    expected_eps = sub.sort_values("datadate").iloc[-1]["epsf12"]
-    assert np.isclose(eps, expected_eps), f"Expected {expected_eps}, got {eps}"
+    if comp_path.exists():
+        eps = get_eps_from_compustat("XOM", "2008-04-15", comp_path, lag_days=90)
+        assert not np.isnan(eps)
+        comp = pd.read_csv(comp_path)
+        comp["datadate"] = pd.to_datetime(comp["datadate"])
+        sub = comp[(comp["tic"] == "XOM") & (comp["datadate"] <= pd.to_datetime("2008-04-15") - pd.Timedelta(days=90))]
+        expected_eps = sub.sort_values("datadate").iloc[-1]["epsf12"]
+        assert np.isclose(eps, expected_eps), f"Expected {expected_eps}, got {eps}"
 
 
 if __name__ == "__main__":
