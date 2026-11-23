@@ -196,8 +196,8 @@ def k_lag_graph_learning_model(
     J = P_data.shape[2]
     assert Z_data.shape == (M, N, N), "Z_data must be (M, N, N)"
     assert M >= 2, "Need at least two time points"
-    if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or k < 1:
-        raise ValueError("k must be a positive integer")
+    if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or k < 0:
+        raise ValueError("k must be a non-negative integer")
     effective_k = min(int(k), M - 1)
 
     model = pyo.ConcreteModel()
@@ -358,6 +358,11 @@ def solve_instance(
         for j in m.Jidx:
             m.beta[j, t].value = 0.0
 
+    import os
+    idaes_bin = str(Path.home() / ".idaes" / "bin")
+    if Path(idaes_bin).exists() and idaes_bin not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = idaes_bin + os.pathsep + os.environ.get("PATH", "")
+
     solver = pyo.SolverFactory("ipopt")
     if ipopt_opts:
         for k_, v_ in ipopt_opts.items():
@@ -388,4 +393,72 @@ def solve_instance(
             s_hat[i, t - 1] = pyo.value(m.s_hat[i, t])
 
     return m, results, obj_val, L, c1, c2, beta, s_hat
+
+
+def compute_beta_standard_errors(
+    X: np.ndarray,
+    P: np.ndarray,
+    beta: np.ndarray,
+    s_hat: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Compute standard errors and 95% confidence intervals for beta[t].
+
+    Addresses Reviewer 2 Comment 1.5:
+    Conditional on the fitted model, at each time step t (from 1 to M-1):
+        residuals e[t] = X[:, t] - s_hat[:, t-1]
+        sigma_sq[t] = sum(e[t]^2) / (N - J)
+        Cov_ols(beta[t]) = sigma_sq[t] * (P[t]^T P[t])^{-1}
+        Cov_robust(beta[t]) = (P[t]^T P[t])^{-1} (P[t]^T diag(e[t]^2) P[t]) (P[t]^T P[t])^{-1}
+    """
+    N, M = X.shape
+    J, M_pred = beta.shape
+    assert M_pred == M - 1, f"Expected {M-1} predictions, got {M_pred}"
+
+    beta_se = np.zeros((J, M - 1))
+    beta_se_robust = np.zeros((J, M - 1))
+    residuals = np.zeros((N, M - 1))
+    sigma_sq = np.zeros(M - 1)
+
+    df = max(N - J, 1)
+
+    for t in range(1, M):
+        idx = t - 1
+        P_t = P[t, :, :]  # shape (N, J)
+        y_true = X[:, t]   # shape (N,)
+        y_pred = s_hat[:, idx]  # shape (N,)
+        e_t = y_true - y_pred
+        residuals[:, idx] = e_t
+
+        rss_t = float(np.sum(e_t ** 2))
+        s2 = rss_t / df
+        sigma_sq[idx] = s2
+
+        PtP = P_t.T @ P_t
+        try:
+            PtP_inv = np.linalg.pinv(PtP)
+        except Exception:
+            PtP_inv = np.eye(J)
+
+        # Classical OLS Covariance
+        cov_ols = s2 * PtP_inv
+        se_ols = np.sqrt(np.maximum(np.diag(cov_ols), 1e-12))
+        beta_se[:, idx] = se_ols
+
+        # White Heteroskedasticity-Consistent Covariance
+        meat = (P_t.T * (e_t ** 2)) @ P_t
+        cov_white = PtP_inv @ meat @ PtP_inv
+        se_white = np.sqrt(np.maximum(np.diag(cov_white), 1e-12))
+        beta_se_robust[:, idx] = se_white
+
+    ci_lower = beta - 1.96 * beta_se_robust
+    ci_upper = beta + 1.96 * beta_se_robust
+
+    return {
+        "beta_se": beta_se,
+        "beta_se_robust": beta_se_robust,
+        "beta_ci_lower": ci_lower,
+        "beta_ci_upper": ci_upper,
+        "residuals": residuals,
+        "sigma_sq": sigma_sq,
+    }
 

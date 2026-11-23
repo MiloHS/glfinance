@@ -218,12 +218,19 @@ def synthetic_inputs(
     return returns, risk_free, manifest
 
 
-def fred(api_key: str = "5100ac25b1f1bea068493da8feedd614", start_date: str = "1990-01-01", end_date: str = "2025-07-23") -> pd.DataFrame:
+def fred(api_key: str | None = None, start_date: str = "1990-01-01", end_date: str = "2025-07-23") -> pd.DataFrame:
     """Fetch monthly interest rate series across countries via FRED API."""
+    import os
     import datetime
     from fredapi import Fred
 
-    client = Fred(api_key=api_key)
+    key = api_key or os.environ.get("FRED_API_KEY")
+    if not key:
+        raise ValueError(
+            "FRED API key is required. Pass api_key directly or set the FRED_API_KEY environment variable."
+        )
+
+    client = Fred(api_key=key)
     start = pd.to_datetime(start_date)
     end = pd.to_datetime(end_date)
 

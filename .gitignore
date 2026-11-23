@@ -16,6 +16,7 @@ dist/
 # Downloaded data and generated artifacts
 /data/
 /results/
+/outputs/
 /scripts/
 cache/
 *.csv
@@ -34,10 +35,30 @@ Fama-French Factors/
 *.ipynb
 !notebooks/portfolio_walk_forward.ipynb
 
-# Local secrets, credentials, and solver licenses
+# Dry run outputs, trial artifacts, and temporary runs
+*dryrun*.png
+*dryrun*.pkl*
+*dryrun*.json
+*dryrun*.csv
+*dryrun_results*
+*_dryrun*
+*dryrun*
+!*dryrun_plots.py
+
+# Local secrets, personal API keys, credentials, and solver licenses
 .env
 .env.*
 !.env.example
 *.lic
 *.pem
 *.key
+*api_key*
+*token*
+*secret*
+*credential*
+
+# Figure generation and plotting code must NEVER be gitignored
+!src/glfinance/experiments/*dryrun*.py
+!src/glfinance/experiments/dryrun_plots.py
+!src/glfinance/experiments/generate_paper_figures.py
+

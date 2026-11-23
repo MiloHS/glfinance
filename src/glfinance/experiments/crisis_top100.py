@@ -141,8 +141,35 @@ def build_crisis_dataset(
     cache_path = repo_root / cache_dir
     cache_path.mkdir(parents=True, exist_ok=True)
 
-    compustat_df = pd.read_csv(compustat_path)
-    crsp_df = pd.read_csv(crsp_path)
+    # Automatically resolve new data filenames if default names are not found
+    crsp_file = Path(crsp_path)
+    if not crsp_file.exists():
+        for cand in [
+            repo_root / crsp_path,
+            repo_root / f"crsp_{experiment_name}2.csv",
+            repo_root / f"crsp_{experiment_name}.csv",
+            Path(f"crsp_{experiment_name}2.csv"),
+            Path(f"crsp_{experiment_name}.csv"),
+        ]:
+            if cand.exists():
+                crsp_file = cand
+                break
+
+    comp_file = Path(compustat_path)
+    if not comp_file.exists():
+        for cand in [
+            repo_root / compustat_path,
+            repo_root / f"compustat_{experiment_name}.csv",
+            repo_root / f"{experiment_name}_compustat.csv",
+            Path(f"compustat_{experiment_name}.csv"),
+            Path(f"{experiment_name}_compustat.csv"),
+        ]:
+            if cand.exists():
+                comp_file = cand
+                break
+
+    compustat_df = pd.read_csv(comp_file)
+    crsp_df = pd.read_csv(crsp_file)
 
     # Check if cached tickers file exists to bypass select_top_market_cap_tickers download
     tickers_cache_file = cache_path / f"top_{top_n}_tickers_{experiment_name}_v2.json"
@@ -153,36 +180,29 @@ def build_crisis_dataset(
         print(f"Loaded {len(top_tickers)} tickers from cache ➜ {tickers_cache_file.name}")
     else:
         print(f"Extracting top market cap tickers for '{experiment_name}' from CRSP & Compustat...")
+        # Request candidates with buffer so any stocks with missing data are seamlessly replaced
         top_tickers = select_top_market_cap_tickers(
-            crsp_path=crsp_path,
-            compustat_path=compustat_path,
-            top_n=top_n,
+            crsp_path=crsp_file,
+            compustat_path=comp_file,
+            top_n=top_n + 25,
             start_date=start_date,
             end_date=end_date,
             price_df=price_df,
         )
-        import json
-        with open(tickers_cache_file, "w") as f:
-            json.dump(top_tickers, f)
 
     if regressor_names is None:
+        # Focus strictly on firm-specific characteristics (Reviewer 2 comment on identification of common factors)
         regressor_names = [
             "momentum",
             "volatility",
             "pe_ratio",
             "turnover",
-            "interest_rate",
-            "mkt-rf",
-            "smb",
-            "hml",
         ]
 
-    rates_df = fred()
+    rates_df = fred() if "interest_rate" in regressor_names else None
 
     base_path = Path(ff_base_path)
-    if not base_path.exists():
-        ff_map = {}
-    else:
+    if any(r in regressor_names for r in ["mkt-rf", "smb", "hml"]) and base_path.exists():
         ff_map = {
             "US": load_ff_csv(base_path / "F-F_Factors_US.csv"),
             "EU": load_ff_csv(base_path / "F-F_Factors_EU.csv"),
@@ -190,6 +210,8 @@ def build_crisis_dataset(
             "ASIAPAC_EXJAP": load_ff_csv(base_path / "F-F_Factors_AsiaPac_exJap.csv"),
             "NA": load_ff_csv(base_path / "F-F_Factors_NA.csv"),
         }
+    else:
+        ff_map = {}
 
     X, P, Z, aligned_tickers, dates = prepare_XPZ(
         tickers=top_tickers,
@@ -208,6 +230,19 @@ def build_crisis_dataset(
         return_dates=True,
     )
 
+    # Truncate strictly to exactly top_n stocks in rank order
+    if len(aligned_tickers) > top_n:
+        aligned_tickers = aligned_tickers[:top_n]
+        X = X[:top_n, :]
+        P = P[:, :top_n, :]
+        Z = Z[:, :top_n, :top_n]
+
+    # Cache finalized exact top_n tickers
+    if not tickers_cache_file.exists():
+        import json
+        with open(tickers_cache_file, "w") as f:
+            json.dump(aligned_tickers, f)
+
     print(f"Dataset shapes ➜ X: {X.shape}, P: {P.shape}, Z: {Z.shape}, Dates: {len(dates)}")
     return X, P, Z, aligned_tickers, regressor_names, dates
 
@@ -218,6 +253,7 @@ def solve_crisis_model(
     Z: np.ndarray,
     top_tickers: list[str],
     dates: list[pd.Timestamp] | None = None,
+    regressor_names: list[str] | None = None,
     k: int = 1,
     gammas: tuple[float, float, float] = (40.0, 1.5e-5, 1.5e-2),
     experiment_name: str = "crisis",
@@ -236,6 +272,7 @@ def solve_crisis_model(
     out_dict = {
         "tickers": top_tickers,
         "dates": [pd.Timestamp(d) for d in dates] if dates is not None else [],
+        "regressor_names": regressor_names or ["momentum", "volatility", "pe_ratio", "turnover"],
         "results": results,
         "objective": obj_val,
         "L": L,
@@ -247,6 +284,11 @@ def solve_crisis_model(
         "P": P,
         "Z": Z,
     }
+
+    # Compute standard errors and confidence bands for beta[t] (Comment 1.5)
+    from glfinance.graph import compute_beta_standard_errors
+    se_dict = compute_beta_standard_errors(X, P, beta, s_hat)
+    out_dict.update(se_dict)
 
     # Automatically save numerical results dictionary to cache
     import gzip, pickle
@@ -287,5 +329,5 @@ def run_crisis_experiment(
         cache_dir=cache_dir,
         experiment_name=experiment_name,
     )
-    return solve_crisis_model(X, P, Z, top_tickers, dates=dates, k=k, gammas=gammas, experiment_name=experiment_name)
+    return solve_crisis_model(X, P, Z, top_tickers, dates=dates, regressor_names=reg_names, k=k, gammas=gammas, experiment_name=experiment_name)
 

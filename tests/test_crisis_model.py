@@ -96,9 +96,13 @@ def test_one_lag_prediction_matches_manuscript_equation() -> None:
         np.testing.assert_allclose(actual, expected)
 
 
-def test_model_rejects_zero_lags() -> None:
-    with pytest.raises(ValueError, match="positive integer"):
-        build_small_model(k=0)
+def test_model_accepts_zero_lags_and_rejects_negative_lags() -> None:
+    # k=0 is accepted as a valid lag-free model
+    model = build_small_model(k=0)
+    assert len(model.Cidx) == 0
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        build_small_model(k=-1)
 
 
 def test_solver_outputs_exclude_initial_time_point(monkeypatch=None) -> None:
@@ -133,3 +137,34 @@ def test_solver_outputs_exclude_initial_time_point(monkeypatch=None) -> None:
     finally:
         if monkeypatch is None:
             pyo.SolverFactory = orig_factory
+
+
+def test_beta_standard_errors_and_confidence_intervals() -> None:
+    """Verify that compute_beta_standard_errors generates valid SEs and 95% CIs (Comment 1.5)."""
+    from glfinance.graph import compute_beta_standard_errors
+
+    N, M, J = 20, 10, 5
+    np.random.seed(42)
+    X = np.random.randn(N, M)
+    P = np.random.randn(M, N, J)
+    P[:, :, 0] = 1.0  # Intercept
+    beta = np.random.randn(J, M - 1)
+    s_hat = np.zeros((N, M - 1))
+    for t in range(1, M):
+        s_hat[:, t - 1] = P[t, :, :] @ beta[:, t - 1] + 0.1 * np.random.randn(N)
+
+    se_dict = compute_beta_standard_errors(X, P, beta, s_hat)
+
+    assert "beta_se" in se_dict
+    assert "beta_se_robust" in se_dict
+    assert "beta_ci_lower" in se_dict
+    assert "beta_ci_upper" in se_dict
+
+    assert se_dict["beta_se"].shape == (J, M - 1)
+    assert se_dict["beta_se_robust"].shape == (J, M - 1)
+    assert np.all(se_dict["beta_se"] > 0)
+    assert np.all(se_dict["beta_se_robust"] > 0)
+
+    # 95% CI bounds must strictly enclose beta
+    assert np.all(se_dict["beta_ci_lower"] < beta)
+    assert np.all(se_dict["beta_ci_upper"] > beta)

@@ -20,21 +20,24 @@ def run_regressor_experiment(
     gammas: tuple[float, float, float] = (40.0, 1e-5, 1.5e-2),
 ):
     if regressor_names is None:
+        # Focus strictly on firm-specific characteristics (Reviewer 2 comment on identification of common factors)
         regressor_names = [
-            "momentum", "volatility", "pe_ratio", "turnover",
-            "interest_rate", "mkt-rf", "smb", "hml"
+            "momentum", "volatility", "pe_ratio", "turnover"
         ]
 
-    rates_df = fred()
+    rates_df = fred() if "interest_rate" in regressor_names else None
 
     base_path = Path(ff_base_path)
-    ff_map = {
-        "US": load_ff_csv(base_path / "F-F_Factors_US.csv"),
-        "EU": load_ff_csv(base_path / "F-F_Factors_EU.csv"),
-        "JAPAN": load_ff_csv(base_path / "F-F_Factors_Jap.csv"),
-        "ASIAPAC_EXJAP": load_ff_csv(base_path / "F-F_Factors_AsiaPac_exJap.csv"),
-        "NA": load_ff_csv(base_path / "F-F_Factors_NA.csv"),
-    }
+    if any(r in regressor_names for r in ["mkt-rf", "smb", "hml"]) and base_path.exists():
+        ff_map = {
+            "US": load_ff_csv(base_path / "F-F_Factors_US.csv"),
+            "EU": load_ff_csv(base_path / "F-F_Factors_EU.csv"),
+            "JAPAN": load_ff_csv(base_path / "F-F_Factors_Jap.csv"),
+            "ASIAPAC_EXJAP": load_ff_csv(base_path / "F-F_Factors_AsiaPac_exJap.csv"),
+            "NA": load_ff_csv(base_path / "F-F_Factors_NA.csv"),
+        }
+    else:
+        ff_map = {}
 
     X, P, Z = prepare_XPZ(
         tickers=tickers,
