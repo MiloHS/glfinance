@@ -1,96 +1,59 @@
 # GLFinance
 
-This repository contains the maintained, reproducible portfolio and graph learning code for
-*Graph Learning for Financial Time Series: A Regressor-Based Approach*.
+Code for *Graph Learning for Financial Time Series: A Regressor-Based Approach*.
+The portfolio experiment uses public data; the crisis experiments also require licensed WRDS inputs.
+Downloaded data, generated results, and credentials are not included.
 
-The public repository is intentionally code-focused. It excludes downloaded
-market data, binary cache files, generated figure images, legacy notebook
-exports, and private credentials.
+## Setup
 
-## Repository contents
-
-- `src/glfinance/`: maintained graph learning, covariance, portfolio, backtest,
-  data, and reporting code;
-- `configs/portfolio_walk_forward.yaml`: finalized experimental specification;
-- `tests/`: deterministic unit and walk-forward tests; and
-- `notebooks/portfolio_walk_forward.ipynb`: a clean Colab entry point that calls
-  the maintained package rather than duplicating the implementation.
-
----
-
-## Portfolio Walk-Forward Experiment
-
-The portfolio experiment:
-
-- learns one graph per week using only information available at that date;
-- uses the preceding graph only through a temporal smoothness penalty;
-- excludes regressors from portfolio graph learning;
-- tunes the covariance window, retained graph modes, and diagonal shrinkage on
-  the preceding 52 validation weeks;
-- locks the selected hyperparameters for the next 13 unseen weeks; and
-- compares Graph-LW and Graph-Sample against full Ledoit-Wolf, sample
-  covariance, and equal weight.
-
-### Local Setup & Execution
+From the repository root (Python 3.10 or later):
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev,notebook]'
 pytest
-glfinance-portfolio --config configs/portfolio_walk_forward.yaml
 ```
 
-The first experiment run downloads adjusted-close data from Yahoo Finance and a
-three-month Treasury-bill series from FRED. Processed inputs are cached under
-`data/cache/`; generated results are written under `results/`. Both directories
-are ignored by Git because downloaded market data can change or be subject to
-redistribution restrictions. Each run writes a manifest with dates, tickers,
-package versions, and file checksums.
+## Portfolio results
 
-Use `--data-only` to populate and inspect the cache without solving graphs, and
-`--synthetic` for a small offline smoke test.
+The walk-forward experiment selects portfolio parameters on the preceding 52 weeks
+and evaluates them over the next 13-week block. Graph estimation uses asset log
+returns; validation and evaluation use simple portfolio returns.
 
-### Colab
+Run the baseline first. It downloads Yahoo Finance prices and FRED Treasury-bill
+rates to `data/cache/`; no API key is required. Recompute any graphs from the
+previous submission: those runs did not apply the graph-magnitude penalty.
 
-Open `notebooks/portfolio_walk_forward.ipynb`, set `REPOSITORY_PATH` to the
-checked-out repository, install the package, and run the configured experiment.
-No API key or proprietary dataset is required. SCS is the documented default
-solver.
+```bash
+glfinance-portfolio --config configs/portfolio_walk_forward.yaml --output-dir results/portfolio_revision/baseline
+```
 
-### Output Files
+Then run the following in order. All four commands use [the revision configuration](configs/portfolio_revision.yaml) by default.
 
-Each run produces:
+```bash
+# Compare covariance estimators, correlation constructions, and graphs without the prediction term
+python -m glfinance.experiments.portfolio_revision
+# Compare components at fixed settings and measure retained return energy
+python -m glfinance.experiments.portfolio_revision --components
+# Compute bootstrap intervals, variance tests, and block-level figures
+python -m glfinance.experiments.portfolio_revision --inference
+# Check sensitivity to graph regularization and the dissimilarity offset
+python -m glfinance.experiments.portfolio_revision --sensitivity
+```
 
-- `resolved_config.yaml`
-- `data_manifest.json`
-- `solver_status.csv`
-- `selection_history.csv`
-- `weekly_performance.csv`
-- `weekly_weights.csv`
-- `summary.csv`
-- `block_summary.csv`
-- `bootstrap.csv`
-- publication-ready figures under `figures/`
+Outputs are in `results/portfolio_revision/`. Start with `baseline/real/summary.csv`
+and `comparisons/comparison_summary.csv`; the other analyses write to
+`components/`, `inference/`, and `sensitivity/`.
 
-Every reported manuscript value should be traceable to one of these files.
-
----
+For an offline smoke test, run `glfinance-portfolio --synthetic`. For Colab, use
+[the portfolio notebook](notebooks/portfolio_walk_forward.ipynb).
 
 ## Top 100 Crisis & COVID Experiments
 
-This repository also includes the experiment pipeline for large-scale ($N=100$) market network graph learning and regressor evolution across two major historical macroeconomic crises:
+This repository also includes the experiment pipeline for larger-scale ($N=100$) market network graph learning and regressor evolution across two major historical macroeconomic crises:
 1. **2008 Global Financial Crisis (March 2006 – December 2010, $M=54$ months)**
 2. **2020 COVID-19 Liquidity Shock (May 2019 – December 2021, $M=32$ months)**
-
-### Upfront Regressor $Z$-Score Standardization
-To eliminate measurement scale discrepancies across raw financial regressors (e.g., P/E ratios in tens versus volatility in small decimals), input regressors in matrix $\mathbf{P}[t]$ are cross-sectionally $Z$-score standardized ($\mu_{t,j} = 0, \sigma_{t,j} = 1$) across all assets $i$ for each month $t$ inside `prepare_XPZ()` in `src/glfinance/data.py`. 
-
-This guarantees that:
-- Every learned coefficient $\beta_{j,t}$ directly measures the predicted return response to a **1-standard-deviation change** in factor $j$.
-- Market-wide macro factors (Interest Rates, Fama-French Mkt-RF, SMB, HML) have zero cross-sectional variance across stocks, causing IPOPT to assign them **exactly zero ($\beta \equiv 0.0$)**, isolating true stock-level predictive signals (Volatility, Momentum, P/E Ratio, Turnover).
-
----
 
 ## WRDS Data Extraction & Requirements
 
@@ -129,7 +92,7 @@ To reproduce the Top 100 experiments from scratch, researchers should query WRDS
 ---
 
 ## Tracked Candidate Ticker JSON Files
-The exact universe of top 100 market-cap companies evaluated in each experiment is tracked in JSON format under `cache/`:
+Cached candidate lists are in `cache/`:
 - `cache/top_100_tickers_crisis_std.json`: Top 100 candidate tickers for the 2008 Financial Crisis.
 - `cache/top_100_tickers_covid_std.json`: Top 100 candidate tickers for the 2020 COVID period.
 
@@ -173,16 +136,5 @@ run_crisis_experiment(
     experiment_name='covid_std'
 )
 "
-```
-
-
----
-
-## Repository Hygiene
-
-Downloaded market data (`*.csv`, `Fama-French Factors/`), binary cache files (`cache/*.pkl.gz`), generated figure images (`*.png`), and private credentials are excluded by `.gitignore`. Before committing, run:
-
-```bash
-git status --short
 ```
 
