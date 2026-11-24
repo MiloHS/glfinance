@@ -10,14 +10,20 @@ import pandas as pd
 from glfinance.covariance import (
     graph_covariance,
     ledoit_wolf_covariance,
+    pca_factor_covariance,
     sample_covariance,
 )
 from glfinance.portfolio import (
     equal_weights,
     long_only_gmv_weights,
+    portfolio_step,
     turnover,
     unconstrained_gmv_weights,
 )
+
+
+GRAPH_METHODS = {"GraphLW", "GraphSample", "GraphLWResidual"}
+PCA_METHODS = {"PCAFactor", "PCALWResidual"}
 
 
 @dataclass(frozen=True)
@@ -26,10 +32,11 @@ class Hyperparameters:
     k_fraction: float | None = None
     rho: float | None = None
 
-    def retained_modes(self, n_assets: int) -> int | None:
+    def retained_modes(self, n_assets: int, *, pca: bool = False) -> int | None:
         if self.k_fraction is None:
             return None
-        return min(n_assets, max(1, int(np.ceil(self.k_fraction * n_assets))))
+        retained = min(n_assets, max(1, int(np.ceil(self.k_fraction * n_assets))))
+        return min(retained, self.training_window - 1) if pca else retained
 
 
 @dataclass
@@ -44,6 +51,7 @@ class CandidatePath:
     first_target_position: int
     realized_returns: np.ndarray
     weights: np.ndarray
+    turnovers: np.ndarray
 
     def offsets(self, target_positions: range) -> np.ndarray:
         return np.arange(
@@ -55,18 +63,29 @@ class CandidatePath:
 
 
 def candidate_grid(
-    method: str, portfolio_config: dict[str, Any]
+    method: str, portfolio_config: dict[str, Any], n_assets: int | None = None
 ) -> list[Hyperparameters]:
     training_windows = [int(value) for value in portfolio_config["training_windows"]]
-    if method in {"GraphLW", "GraphSample"}:
-        return [
+    if method in GRAPH_METHODS | PCA_METHODS:
+        candidates = [
             Hyperparameters(int(training), float(k_fraction), float(rho))
             for training, k_fraction, rho in product(
                 training_windows,
                 portfolio_config["k_fractions"],
-                portfolio_config["rho_values"],
+                [0.0] if method == "PCAFactor" else portfolio_config["rho_values"],
             )
         ]
+        if method in PCA_METHODS and n_assets is not None:
+            unique = {}
+            for parameters in candidates:
+                key = (parameters.training_window, parameters.retained_modes(n_assets, pca=True), parameters.rho)
+                unique.setdefault(key, parameters)
+            return list(unique.values())
+        return candidates
+    if method == "LedoitWolfLong":
+        return [Hyperparameters(value) for value in sorted(set(training_windows + [100]))]
+    if method == "LedoitWolf100":
+        return [Hyperparameters(100)]
     if method in {"LedoitWolf", "Sample"}:
         return [Hyperparameters(training_window=value) for value in training_windows]
     if method == "EqualWeight":
@@ -92,6 +111,7 @@ def weights_for_target(
     graphs: dict[pd.Timestamp, np.ndarray],
     delta: float,
     long_only: bool = False,
+    sample_ddof: int = 1,
 ) -> np.ndarray:
     """Calculate weights using data strictly before target_position."""
     n_assets = returns.shape[1]
@@ -104,7 +124,7 @@ def weights_for_target(
     training = _training_matrix(
         values, target_position, parameters.training_window
     )
-    if method in {"GraphLW", "GraphSample"}:
+    if method in GRAPH_METHODS:
         graph_date = pd.Timestamp(returns.index[target_position - 1])
         if graph_date not in graphs:
             raise KeyError(f"No causal graph is available for {graph_date.date()}.")
@@ -118,10 +138,23 @@ def weights_for_target(
             rho=parameters.rho,
             delta=delta,
             subspace_estimator=(
-                "LedoitWolf" if method == "GraphLW" else "Sample"
+                "Sample" if method == "GraphSample" else "LedoitWolf"
             ),
+            restore_residual=method == "GraphLWResidual",
+            sample_ddof=sample_ddof,
         )
-    elif method == "LedoitWolf":
+    elif method in PCA_METHODS:
+        retained = parameters.retained_modes(n_assets, pca=True)
+        if retained is None or parameters.rho is None:
+            raise ValueError(f"{method} requires k_fraction and rho.")
+        covariance = pca_factor_covariance(
+            training,
+            k=retained,
+            delta=delta,
+            subspace_estimator="sample" if method == "PCAFactor" else "LedoitWolf",
+            rho=parameters.rho,
+        )
+    elif method in {"LedoitWolf", "LedoitWolfLong", "LedoitWolf100"}:
         covariance = ledoit_wolf_covariance(training)
     elif method == "Sample":
         covariance = sample_covariance(training)
@@ -130,6 +163,54 @@ def weights_for_target(
     if long_only:
         return long_only_gmv_weights(covariance)
     return unconstrained_gmv_weights(covariance)
+
+
+def evaluate_fixed_schedule(
+    method: str,
+    schedule: pd.DataFrame,
+    returns: pd.DataFrame,
+    risk_free: pd.Series,
+    graphs: dict[pd.Timestamp, np.ndarray],
+    delta: float,
+    long_only: bool = False,
+    sample_ddof: int = 1,
+) -> BacktestArtifacts:
+    """Replay a saved block-selection schedule without selecting any new parameters."""
+    performance_rows, weight_rows = [], []
+    previous_drifted = None
+    previous_position = None
+    values = returns.to_numpy(dtype=float)
+    for row in schedule.sort_values("unseen_start").itertuples():
+        if pd.Timestamp(row.validation_end) >= pd.Timestamp(row.unseen_start):
+            raise ValueError("Saved validation must end before its unseen block.")
+        parameters = Hyperparameters(int(row.training_window), float(row.k_fraction), float(row.rho))
+        start = returns.index.get_loc(pd.Timestamp(row.unseen_start))
+        stop = returns.index.get_loc(pd.Timestamp(row.unseen_end)) + 1
+        for position in range(start, stop):
+            if previous_position is not None and position != previous_position + 1:
+                raise ValueError("Saved blocks must cover consecutive, nonoverlapping weeks.")
+            weights = weights_for_target(
+                method, parameters, position, returns, graphs, delta,
+                long_only=long_only, sample_ddof=sample_ddof,
+            )
+            realized, drifted = portfolio_step(weights, values[position])
+            date = returns.index[position]
+            risk_free_return = float(risk_free.loc[date])
+            performance_rows.append({
+                "date": date, "block_id": row.block_id, "method": method,
+                "portfolio_return": realized, "risk_free_return": risk_free_return,
+                "excess_return": realized - risk_free_return,
+                "turnover": turnover(weights, previous_drifted),
+                "gross_exposure": float(np.abs(weights).sum()),
+                "training_window": parameters.training_window,
+                "k_fraction": parameters.k_fraction, "k": parameters.retained_modes(returns.shape[1]),
+                "rho": parameters.rho,
+            })
+            weight_rows.extend({"date": date, "block_id": row.block_id, "method": method,
+                                "symbol": symbol, "weight": float(weight)}
+                               for symbol, weight in zip(returns.columns, weights))
+            previous_drifted, previous_position = drifted, position
+    return BacktestArtifacts(pd.DataFrame(performance_rows), pd.DataFrame(weight_rows), schedule.copy())
 
 
 def evaluate_parameters(
@@ -156,14 +237,15 @@ def evaluate_parameters(
             delta,
             long_only=long_only,
         )
-        portfolio_returns.append(float(values[target_position] @ weights))
+        realized, drifted = portfolio_step(weights, values[target_position])
+        portfolio_returns.append(realized)
         turnovers.append(turnover(weights, previous_weights))
-        previous_weights = weights
+        previous_weights = drifted
     if len(portfolio_returns) < 2:
         raise ValueError("Validation requires at least two target weeks.")
     return (
         float(np.var(portfolio_returns, ddof=1)),
-        float(np.mean(turnovers)),
+        float(np.nanmean(turnovers)),
     )
 
 
@@ -178,7 +260,7 @@ def select_parameters(
     evaluated: list[tuple[float, float, int, float, float, Hyperparameters]] = []
     delta = float(portfolio_config["delta"])
     long_only = bool(portfolio_config.get("long_only", False))
-    for parameters in candidate_grid(method, portfolio_config):
+    for parameters in candidate_grid(method, portfolio_config, returns.shape[1]):
         realized_variance, mean_turnover = evaluate_parameters(
             method,
             parameters,
@@ -219,9 +301,11 @@ def _precompute_candidate_paths(
 
     for method in methods:
         method_paths: dict[Hyperparameters, CandidatePath] = {}
-        for parameters in candidate_grid(method, portfolio_config):
+        for parameters in candidate_grid(method, portfolio_config, returns.shape[1]):
             weights_rows: list[np.ndarray] = []
             realized_returns: list[float] = []
+            turnovers: list[float] = []
+            previous_drifted: np.ndarray | None = None
             for target_position in target_positions:
                 weights = weights_for_target(
                     method,
@@ -233,11 +317,15 @@ def _precompute_candidate_paths(
                     long_only=long_only,
                 )
                 weights_rows.append(weights)
-                realized_returns.append(float(values[target_position] @ weights))
+                realized, drifted = portfolio_step(weights, values[target_position])
+                realized_returns.append(realized)
+                turnovers.append(turnover(weights, previous_drifted))
+                previous_drifted = drifted
             method_paths[parameters] = CandidatePath(
                 first_target_position=first_target_position,
                 realized_returns=np.asarray(realized_returns, dtype=float),
                 weights=np.vstack(weights_rows),
+                turnovers=np.asarray(turnovers, dtype=float),
             )
         paths[method] = method_paths
     return paths
@@ -251,17 +339,12 @@ def _select_from_candidate_paths(
     for parameters, path in method_paths.items():
         offsets = path.offsets(validation_positions)
         realized = path.realized_returns[offsets]
-        validation_weights = path.weights[offsets]
-        weekly_turnovers = np.concatenate(
-            [
-                np.zeros(1),
-                np.sum(np.abs(np.diff(validation_weights, axis=0)), axis=1),
-            ]
-        )
+        weekly_turnovers = path.turnovers[offsets].copy()
+        weekly_turnovers[0] = np.nan  # Exclude establishment of this validation path.
         evaluated.append(
             (
                 float(np.var(realized, ddof=1)),
-                float(np.mean(weekly_turnovers)),
+                float(np.nanmean(weekly_turnovers)),
                 -(parameters.training_window or 0),
                 parameters.k_fraction or 0.0,
                 -(parameters.rho or 0.0),
@@ -332,7 +415,7 @@ def run_nested_walk_forward(
                     "unseen_end": returns.index[block_stop - 1],
                     "training_window": parameters.training_window,
                     "k_fraction": parameters.k_fraction,
-                    "k": parameters.retained_modes(n_assets),
+                    "k": parameters.retained_modes(n_assets, pca=method in PCA_METHODS),
                     "rho": parameters.rho,
                     "validation_variance": validation_variance,
                     "validation_turnover": validation_turnover,
@@ -345,10 +428,12 @@ def run_nested_walk_forward(
                 path = candidate_paths[method][selected[method]]
                 offset = target_position - path.first_target_position
                 weights = path.weights[offset]
-                portfolio_return = float(returns_values[target_position] @ weights)
+                portfolio_return, drifted = portfolio_step(
+                    weights, returns_values[target_position]
+                )
                 risk_free_return = float(risk_free.loc[date])
                 current_turnover = turnover(weights, previous_weights[method])
-                previous_weights[method] = weights
+                previous_weights[method] = drifted
                 performance_rows.append(
                     {
                         "date": date,
@@ -361,7 +446,7 @@ def run_nested_walk_forward(
                         "gross_exposure": float(np.sum(np.abs(weights))),
                         "training_window": selected[method].training_window,
                         "k_fraction": selected[method].k_fraction,
-                        "k": selected[method].retained_modes(n_assets),
+                        "k": selected[method].retained_modes(n_assets, pca=method in PCA_METHODS),
                         "rho": selected[method].rho,
                     }
                 )

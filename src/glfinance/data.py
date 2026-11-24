@@ -85,13 +85,47 @@ def download_weekly_log_returns(
     return returns
 
 
+def treasury_bill_weekly_returns(
+    discount_percent: pd.Series, week_ends: pd.DatetimeIndex
+) -> pd.Series:
+    """Equivalent seven-day simple accrual of a 91-day discount-basis bill.
+
+    With d the decimal annual discount quote, the price per unit face value
+    is P = 1 - d*91/360; the weekly proxy is P**(-7/91) - 1. This is an
+    accrual approximation, not a realized mark-to-market bill return.
+    Use the last dated quote strictly before the preceding Friday, allowing
+    a conservative publication lag. Week-end labels denote the return week.
+    """
+    rates = discount_percent.astype(float).dropna().sort_index()
+    if rates.empty or not rates.index.is_unique:
+        raise ValueError("Treasury discount quotes must have unique dates and values.")
+    # The preceding Friday is seven days earlier; exclude that quote date too.
+    available_dates = pd.DatetimeIndex(
+        [date - pd.DateOffset(days=8) for date in week_ends]
+    )
+    known_rates = rates.reindex(available_dates, method="ffill")
+    if known_rates.isna().any():
+        raise ValueError("A return week lacks a prior Treasury discount quote.")
+    discount = known_rates.to_numpy() / 100.0
+    price = 1.0 - discount * 91.0 / 360.0
+    if not np.all(np.isfinite(price)) or np.any(price <= 0.0):
+        raise ValueError("Treasury discount quotes imply invalid bill prices.")
+    weekly = np.expm1(-np.log(price) * 7.0 / 91.0)
+    result = pd.Series(weekly, index=week_ends, name="risk_free")
+    result.index.name = "date"
+    return result
+
+
 def download_weekly_risk_free(
     series: str, start_date: str, end_date: str, weekly_rule: str = "W-FRI"
 ) -> pd.Series:
-    """Download a FRED annual-percent series and convert it to weekly returns."""
+    """Download DTB3 discount quotes and form prior-information weekly accruals."""
+    if series != "DTB3" or weekly_rule != "W-FRI":
+        raise ValueError("The portfolio risk-free conversion requires DTB3 and W-FRI.")
+    download_start = (pd.Timestamp(start_date) - pd.DateOffset(days=21)).date()
     url = (
         "https://fred.stlouisfed.org/graph/fredgraph.csv"
-        f"?id={series}&cosd={start_date}&coed={end_date}"
+        f"?id={series}&cosd={download_start}&coed={end_date}"
     )
     frame = pd.read_csv(url, na_values=".")
     if frame.shape[1] < 2:
@@ -101,11 +135,8 @@ def download_weekly_risk_free(
     if series not in frame:
         raise RuntimeError(f"FRED response did not contain {series}.")
     annual_percent = frame.set_index(date_column)[series].astype(float)
-    weekly_annual = annual_percent.resample(weekly_rule).last().ffill()
-    weekly_return = (1.0 + weekly_annual / 100.0) ** (1.0 / 52.0) - 1.0
-    weekly_return.name = "risk_free"
-    weekly_return.index.name = "date"
-    return weekly_return.dropna()
+    week_ends = pd.date_range(start_date, end_date, freq=weekly_rule, inclusive="left")
+    return treasury_bill_weekly_returns(annual_percent, week_ends)
 
 
 def load_or_download_inputs(config: dict[str, Any], refresh: bool = False) -> tuple[pd.DataFrame, pd.Series, dict[str, Any]]:
@@ -116,7 +147,8 @@ def load_or_download_inputs(config: dict[str, Any], refresh: bool = False) -> tu
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     returns_path = cache_dir / "weekly_log_returns.csv"
-    risk_free_path = cache_dir / "weekly_risk_free.csv"
+    # A distinct filename prevents reuse of the submitted annual-compounding cache.
+    risk_free_path = cache_dir / "weekly_risk_free_dtb3_simple.csv"
     manifest_path = cache_dir / "data_manifest.json"
 
     symbols = [item["symbol"] for item in data_config["tickers"]]
@@ -164,6 +196,15 @@ def load_or_download_inputs(config: dict[str, Any], refresh: bool = False) -> tu
         "price_field": data_config["price_field"],
         "risk_free_source": data_config["risk_free_source"],
         "risk_free_series": data_config["risk_free_series"],
+        "portfolio_return_convention": "weighted_asset_simple_returns",
+        "risk_free_conversion": {
+            "quote_basis": "annual_discount_percent_actual_360",
+            "assumed_maturity_days": 91,
+            "accrual_days": 7,
+            "formula": "(1 - (DTB3/100)*91/360)**(-7/91) - 1",
+            "quote_timing": "last dated quote strictly before prior Friday",
+            "interpretation": "equivalent accrual proxy, not bill holding-period return",
+        },
         "start_date": experiment["start_date"],
         "end_date_exclusive": experiment["end_date"],
         "first_week": str(returns.index.min().date()),

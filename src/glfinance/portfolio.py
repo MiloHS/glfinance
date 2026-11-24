@@ -114,7 +114,33 @@ def long_only_gmv_weights(
     return result
 
 
-def turnover(weights: np.ndarray, previous_weights: np.ndarray | None) -> float:
-    if previous_weights is None:
-        return 0.0
-    return float(np.sum(np.abs(np.asarray(weights) - np.asarray(previous_weights))))
+def portfolio_step(
+    weights: np.ndarray, asset_log_returns: np.ndarray
+) -> tuple[float, np.ndarray]:
+    """Return the simple portfolio return and weights after the holding period.
+
+    Beginning-of-period weights sum to one and may include shorts. Trading,
+    borrowing, and short-lending costs are excluded.
+    """
+    weights = np.asarray(weights, dtype=float)
+    log_returns = np.asarray(asset_log_returns, dtype=float)
+    if weights.ndim != 1 or weights.shape != log_returns.shape:
+        raise ValueError("Weights and asset log returns must be matching vectors.")
+    if not np.all(np.isfinite(weights)) or not np.all(np.isfinite(log_returns)):
+        raise ValueError("Weights and returns must be finite.")
+    if not np.isclose(weights.sum(), 1.0, rtol=0.0, atol=1.0e-8):
+        raise ValueError("Beginning-of-period weights must sum to one.")
+    simple_returns = np.expm1(log_returns)
+    realized = float(weights @ simple_returns)
+    wealth = 1.0 + realized
+    if not np.isfinite(wealth) or wealth <= 0.0:
+        raise RuntimeError("Portfolio wealth became nonpositive or non-finite.")
+    drifted = weights * (1.0 + simple_returns) / wealth
+    return realized, drifted
+
+
+def turnover(weights: np.ndarray, drifted_weights: np.ndarray | None) -> float:
+    """One-way turnover versus pre-trade holdings; initial establishment is omitted."""
+    if drifted_weights is None:
+        return float("nan")
+    return 0.5 * float(np.sum(np.abs(np.asarray(weights) - drifted_weights)))
