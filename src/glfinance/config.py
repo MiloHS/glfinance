@@ -49,6 +49,13 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("All k fractions must be in (0, 1].")
     if any(not 0 <= float(value) <= 1 for value in portfolio["rho_values"]):
         raise ValueError("All rho values must be in [0, 1].")
+    graph = config["graph"]
+    if graph.get("correlation_mode", "absolute") not in {"absolute", "positive"}:
+        raise ValueError("graph.correlation_mode must be absolute or positive.")
+    if not float(graph.get("epsilon", 0.01)) > 0:
+        raise ValueError("graph.epsilon must be positive.")
+    if not isinstance(graph.get("include_prediction", True), bool):
+        raise ValueError("graph.include_prediction must be boolean.")
 
 
 def resolved_config(config: dict[str, Any], base_dir: str | Path) -> dict[str, Any]:

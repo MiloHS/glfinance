@@ -11,6 +11,9 @@ from pathlib import Path
 
 import scipy
 
+# Saved portfolio graphs from earlier objectives must not be silently reused.
+PORTFOLIO_GRAPH_OBJECTIVE = "vectorized_frobenius_v1"
+
 # Ensure IDAES solver directory and gfortran libraries are in PATH / DYLD_LIBRARY_PATH
 idaes_bin = str(Path.home() / ".idaes" / "bin")
 if idaes_bin not in os.environ.get("PATH", ""):
@@ -34,14 +37,24 @@ class GraphSolveRecord:
     solve_time: float | None
 
 
-def correlation_distance(signals: np.ndarray, epsilon: float = 0.01) -> np.ndarray:
-    """Return the absolute-correlation dissimilarity used by the manuscript."""
+def correlation_distance(
+    signals: np.ndarray, epsilon: float = 0.01, mode: str = "absolute"
+) -> np.ndarray:
+    """Correlation dissimilarity; positive mode gives negative pairs no preference."""
     values = np.asarray(signals, dtype=float)
     if values.ndim != 2 or values.shape[1] < 2:
         raise ValueError("signals must have shape (assets, observations>=2).")
+    if not np.isfinite(epsilon) or epsilon <= 0:
+        raise ValueError("epsilon must be finite and positive.")
     correlation = np.corrcoef(values)
     correlation = np.nan_to_num(correlation, nan=0.0, posinf=0.0, neginf=0.0)
-    distance = 1.0 / (np.abs(correlation) + epsilon) - 1.0 / (1.0 + epsilon)
+    if mode == "absolute":
+        strength = np.abs(correlation)
+    elif mode == "positive":
+        strength = np.maximum(correlation, 0.0)
+    else:
+        raise ValueError(f"Unknown correlation mode: {mode}")
+    distance = 1.0 / (strength + epsilon) - 1.0 / (1.0 + epsilon)
     np.fill_diagonal(distance, 0.0)
     return 0.5 * (distance + distance.T)
 
@@ -93,11 +106,15 @@ def solve_causal_laplacian(
         cp.log(cp.diag(laplacian))
     ) / float(n_assets)
     frobenius = float(graph_config["gamma_2"]) * cp.sum_squares(
-        laplacian
+        # Explicit vectorization preserves the quadratic term when CVXPY reduces
+        # symmetric variables (the direct matrix form is dropped in CVXPY 1.9.2).
+        cp.vec(laplacian, order="F")
     ) / n_squared
     prediction_error = cp.sum_squares(x_current - prediction) / float(n_assets)
 
-    objective_terms = [dirichlet, log_barrier, frobenius, prediction_error]
+    objective_terms = [dirichlet, log_barrier, frobenius]
+    if graph_config.get("include_prediction", True):
+        objective_terms.append(prediction_error)
     if previous_laplacian is not None:
         temporal = float(graph_config["gamma_3"]) * cp.sum_squares(
             laplacian - np.asarray(previous_laplacian)
@@ -151,7 +168,11 @@ def learn_causal_graphs(
         window = values[
             position - lookback_weeks + 1 : position + 1
         ].T
-        distance = correlation_distance(window)
+        distance = correlation_distance(
+            window,
+            epsilon=float(graph_config.get("epsilon", 0.01)),
+            mode=str(graph_config.get("correlation_mode", "absolute")),
+        )
         graph, status, objective, stats = solve_causal_laplacian(
             values[position - 1],
             values[position],
