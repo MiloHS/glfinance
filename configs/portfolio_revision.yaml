@@ -1,0 +1,26 @@
+# Part 3: targeted comparisons, each using the existing nested validation.
+base_config: portfolio_walk_forward.yaml
+baseline_dir: results/portfolio_revision/baseline/real
+output_dir: results/portfolio_revision/comparisons
+
+inference:
+  block_lengths: [2, 4, 8, 13]
+  replications: 5000
+  seed: 42
+
+# One parameter at a time; replay baseline selections without retuning.
+sensitivity:
+  gamma_1: [0.05, 0.2]
+  gamma_2: [0.05, 0.2]
+  gamma_3: [0.05, 0.2]
+  epsilon: [0.001, 0.005, 0.02]
+
+comparisons:
+  covariance:
+    methods: [GraphLWResidual, PCAFactor, PCALWResidual, LedoitWolfLong, LedoitWolf100, LedoitWolf]
+  positive_correlation:
+    graph: {correlation_mode: positive}
+    methods: [GraphLW, GraphSample, LedoitWolf]
+  no_prediction:
+    graph: {include_prediction: false}
+    methods: [GraphLW, GraphSample, LedoitWolf]
